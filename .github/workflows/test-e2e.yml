@@ -72,6 +72,7 @@ jobs:
         run: |
           cp env.example .env
           cd backend
+          make swag
           make e2e-plugins-test
           make e2e-test
 
@@ -111,5 +112,6 @@ jobs:
         run: |
           cp env.example .env
           cd backend
+          make swag
           make e2e-plugins-test
           make e2e-test
