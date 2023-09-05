@@ -117,6 +117,10 @@ type GitlabConnection struct {
 	GitlabConn         `mapstructure:",squash"`
 }
 
+func (c GitlabConnection) GetHash() string {
+	return fmt.Sprintf("%d%v", c.ID, c.UpdatedAt)
+}
+
 // This object conforms to what the frontend currently expects.
 type GitlabResponse struct {
 	Name string `json:"name"`

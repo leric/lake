@@ -36,6 +36,12 @@ type RestConnection struct {
 	RateLimitPerHour int    `comment:"api request rate limit per hour" json:"rateLimitPerHour"`
 }
 
+// GetHash returns the hash of the connection, returning empty string for no connection reuse
+// no connection reuse by default, override this function to enable connection reuse
+func (rc RestConnection) GetHash() string {
+	return ""
+}
+
 // GetEndpoint returns the API endpoint of the connection, which always ends with "/"
 func (rc RestConnection) GetEndpoint() string {
 	// make sure the endpoint ends with "/"

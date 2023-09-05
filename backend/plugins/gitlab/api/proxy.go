@@ -18,14 +18,12 @@ limitations under the License.
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"io"
 	"time"
 
 	"github.com/apache/incubator-devlake/core/errors"
 	"github.com/apache/incubator-devlake/core/plugin"
-	helper "github.com/apache/incubator-devlake/helpers/pluginhelper/api"
 	"github.com/apache/incubator-devlake/plugins/gitlab/models"
 )
 
@@ -39,7 +37,7 @@ func Proxy(input *plugin.ApiResourceInput) (*plugin.ApiResourceOutput, errors.Er
 	if err != nil {
 		return nil, err
 	}
-	apiClient, err := helper.NewApiClientFromConnection(context.TODO(), basicRes, connection)
+	apiClient, err := remoteHelper.GetApiClient(connection)
 	if err != nil {
 		return nil, err
 	}

@@ -18,12 +18,14 @@ limitations under the License.
 package api
 
 import (
+	gocontext "context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/apache/incubator-devlake/core/log"
 	"net/http"
 	"strconv"
+
+	"github.com/apache/incubator-devlake/core/log"
 
 	"github.com/apache/incubator-devlake/core/context"
 	"github.com/apache/incubator-devlake/core/errors"
@@ -65,10 +67,11 @@ type SearchRemoteScopesOutput struct {
 
 // RemoteApiHelper is used to write the CURD of connection
 type RemoteApiHelper[Conn plugin.ApiConnection, Scope plugin.ToolLayerScope, ApiScope plugin.ApiScope, Group plugin.ApiGroup] struct {
-	basicRes   context.BasicRes
-	validator  *validator.Validate
-	connHelper *ConnectionApiHelper
-	logger     log.Logger
+	basicRes        context.BasicRes
+	validator       *validator.Validate
+	connHelper      *ConnectionApiHelper
+	httpClientCache map[string]*ApiClient
+	logger          log.Logger
 }
 
 // NewRemoteHelper creates a ScopeHelper for connection management
@@ -84,10 +87,11 @@ func NewRemoteHelper[Conn plugin.ApiConnection, Scope plugin.ToolLayerScope, Api
 		return nil
 	}
 	return &RemoteApiHelper[Conn, Scope, ApiScope, Group]{
-		basicRes:   basicRes,
-		validator:  vld,
-		connHelper: connHelper,
-		logger:     basicRes.GetLogger(),
+		basicRes:        basicRes,
+		validator:       vld,
+		connHelper:      connHelper,
+		httpClientCache: make(map[string]*ApiClient),
+		logger:          basicRes.GetLogger(),
 	}
 }
 
@@ -121,6 +125,24 @@ const (
 	TypeScope string = "scope" // scope, sometimes we call it project. But scope is a more standard noun.
 	TypeMixed string = "mixed"
 )
+
+func (r *RemoteApiHelper[Conn, Scope, ApiScope, Group]) GetApiClient(connection plugin.ApiConnection) (*ApiClient, errors.Error) {
+	key := connection.GetHash()
+	// empty key means no connection reuse
+	if key == "" {
+		return NewApiClientFromConnection(gocontext.TODO(), r.basicRes, connection)
+	}
+
+	if client, ok := r.httpClientCache[key]; ok {
+		return client, nil
+	}
+	newClient, err := NewApiClientFromConnection(gocontext.TODO(), r.basicRes, connection)
+	if err != nil {
+		return nil, err
+	}
+	r.httpClientCache[key] = newClient
+	return newClient, nil
+}
 
 // PrepareFirstPageToken prepares the first page token
 func (r *RemoteApiHelper[Conn, Scope, ApiScope, Group]) PrepareFirstPageToken(customInfo string) (*plugin.ApiResourceOutput, errors.Error) {

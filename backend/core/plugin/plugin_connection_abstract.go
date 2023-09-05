@@ -18,10 +18,11 @@ limitations under the License.
 package plugin
 
 import (
+	"net/http"
+
 	"github.com/apache/incubator-devlake/core/errors"
 	"github.com/apache/incubator-devlake/helpers/pluginhelper/api/apihelperabstract"
 	"github.com/go-playground/validator/v10"
-	"net/http"
 )
 
 // ApiConnection represents a API Connection
@@ -29,6 +30,7 @@ type ApiConnection interface {
 	GetEndpoint() string
 	GetProxy() string
 	GetRateLimitPerHour() int
+	GetHash() string
 }
 
 // ApiAuthenticator is to be implemented by a Concreate Connection if Authorization is required
