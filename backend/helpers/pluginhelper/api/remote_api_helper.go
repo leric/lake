@@ -130,12 +130,15 @@ func (r *RemoteApiHelper[Conn, Scope, ApiScope, Group]) GetApiClient(connection 
 	key := connection.GetHash()
 	// empty key means no connection reuse
 	if key == "" {
+		r.logger.Info("No api client reuse")
 		return NewApiClientFromConnection(gocontext.TODO(), r.basicRes, connection)
 	}
 
 	if client, ok := r.httpClientCache[key]; ok {
+		r.logger.Info("Reused api client")
 		return client, nil
 	}
+	r.logger.Info("Creating new api client")
 	newClient, err := NewApiClientFromConnection(gocontext.TODO(), r.basicRes, connection)
 	if err != nil {
 		return nil, err
