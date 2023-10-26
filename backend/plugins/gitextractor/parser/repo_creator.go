@@ -21,7 +21,7 @@ import (
 	"github.com/apache/incubator-devlake/core/errors"
 	"github.com/apache/incubator-devlake/core/log"
 	"github.com/apache/incubator-devlake/plugins/gitextractor/models"
-	git "github.com/libgit2/git2go/v33"
+	git "github.com/go-git/go-git/v5"
 )
 
 const (
@@ -43,7 +43,7 @@ func NewGitRepoCreator(store models.Store, logger log.Logger) *GitRepoCreator {
 
 // LocalRepo open a local repository
 func (l *GitRepoCreator) LocalRepo(repoPath, repoId string) (*GitRepo, errors.Error) {
-	repo, err := git.OpenRepository(repoPath)
+	repo, err := git.PlainOpen(repoPath)
 	if err != nil {
 		l.logger.Error(err, "OpenRepository")
 		return nil, errors.Convert(err)

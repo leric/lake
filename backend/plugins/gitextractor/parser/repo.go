@@ -23,8 +23,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"regexp"
-	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/apache/incubator-devlake/core/config"
 	"github.com/apache/incubator-devlake/core/dal"
@@ -34,13 +34,18 @@ import (
 	"github.com/apache/incubator-devlake/core/models/domainlayer/code"
 	"github.com/apache/incubator-devlake/core/plugin"
 	"github.com/apache/incubator-devlake/plugins/gitextractor/models"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/format/diff"
+	"github.com/go-git/go-git/v5/plumbing/object"
 
-	git "github.com/libgit2/git2go/v33"
+	git "github.com/go-git/go-git/v5"
 )
 
 const SkipCommitFiles = "SKIP_COMMIT_FILES"
 
 var TypeNotMatchError = "the requested type does not match the type in the ODB"
+
+var splitLinesRegexp = regexp.MustCompile(`[^\n]*(\n|$)`)
 
 type GitRepo struct {
 	store   models.Store
@@ -65,7 +70,11 @@ func (r *GitRepo) CollectAll(subtaskCtx plugin.SubTaskContext) errors.Error {
 	if err != nil {
 		return err
 	}
-	return r.CollectDiffLine(subtaskCtx)
+	err = r.CollectDiffLine(subtaskCtx)
+	if err != nil {
+		return err
+	}
+	return r.CollectSnapshot(subtaskCtx)
 }
 
 // Close resources
@@ -80,30 +89,37 @@ func (r *GitRepo) Close() errors.Error {
 
 // CountTags Count git tags subtask
 func (r *GitRepo) CountTags() (int, errors.Error) {
-	tags, err := r.repo.Tags.List()
-	if err != nil {
-		return 0, errors.Convert(err)
-	}
-	return len(tags), nil
-}
-
-// CountBranches count the number of branches in a git repo
-func (r *GitRepo) CountBranches(ctx context.Context) (int, errors.Error) {
-	var branchIter *git.BranchIterator
-	branchIter, err := r.repo.NewBranchIterator(git.BranchAll)
+	tags, err := r.repo.TagObjects()
 	if err != nil {
 		return 0, errors.Convert(err)
 	}
 	count := 0
-	err = branchIter.ForEach(func(branch *git.Branch, branchType git.BranchType) error {
+	err = tags.ForEach(func(t *object.Tag) error {
+		count += 1
+		return nil
+	})
+	if err != nil {
+		return 0, errors.Convert(err)
+	}
+	return count, nil
+}
+
+// CountBranches count the number of branches in a git repo
+func (r *GitRepo) CountBranches(ctx context.Context) (int, errors.Error) {
+	head, err := r.repo.Head()
+	branchIter, err := r.repo.Branches()
+	if err != nil {
+		return 0, errors.Convert(err)
+	}
+	count := 0
+	err = branchIter.ForEach(func(branch *plumbing.Reference) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		if branch.IsBranch() || branch.IsRemote() {
-			isHead, _ := branch.IsHead()
-			if !isHead {
+		if branch.Name().IsBranch() || branch.Name().IsRemote() {
+			if branch.Name().String() != head.Name().String() {
 				count++
 			}
 		}
@@ -114,24 +130,18 @@ func (r *GitRepo) CountBranches(ctx context.Context) (int, errors.Error) {
 
 // CountCommits count the number of commits in a git repo
 func (r *GitRepo) CountCommits(ctx context.Context) (int, errors.Error) {
-	odb, err := r.repo.Odb()
+	commitIter, err := r.repo.CommitObjects()
 	if err != nil {
 		return 0, errors.Convert(err)
 	}
-	count := 0
-	err = odb.ForEach(func(id *git.Oid) error {
+	var count int
+	err = commitIter.ForEach(func(id *object.Commit) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		commit, e := r.repo.LookupCommit(id)
-		if e != nil && e.Error() != TypeNotMatchError {
-			return errors.Convert(e)
-		}
-		if commit != nil {
-			count++
-		}
+		count++
 		return nil
 	})
 	return count, errors.Convert(err)
@@ -139,77 +149,60 @@ func (r *GitRepo) CountCommits(ctx context.Context) (int, errors.Error) {
 
 // CollectTags Collect Tags data
 func (r *GitRepo) CollectTags(subtaskCtx plugin.SubTaskContext) errors.Error {
-	return errors.Convert(r.repo.Tags.Foreach(func(name string, id *git.Oid) error {
+	tags, err := r.repo.Tags()
+	if err != nil {
+		return errors.Convert(err)
+	}
+	err = tags.ForEach(func(tag *plumbing.Reference) error {
 		select {
 		case <-subtaskCtx.GetContext().Done():
 			return subtaskCtx.GetContext().Err()
 		default:
 		}
-		var err1 error
-		var tag *git.Tag
-		var tagCommit string
-		tag, err1 = r.repo.LookupTag(id)
-		if err1 != nil && err1.Error() != TypeNotMatchError {
-			return errors.Convert(err1)
+		ref := &code.Ref{
+			DomainEntity: domainlayer.DomainEntity{Id: fmt.Sprintf("%s:%s", r.id, tag.Name().String())},
+			RepoId:       r.id,
+			Name:         tag.Name().String(),
+			CommitSha:    tag.Hash().String(),
+			RefType:      TAG,
 		}
-		if tag != nil {
-			tagCommit = tag.TargetId().String()
-		} else {
-			tagCommit = id.String()
+		err1 := r.store.Refs(ref)
+		if err1 != nil {
+			return err1
 		}
-		r.logger.Info("tagCommit:%s", tagCommit)
-		if tagCommit != "" {
-			ref := &code.Ref{
-				DomainEntity: domainlayer.DomainEntity{Id: fmt.Sprintf("%s:%s", r.id, name)},
-				RepoId:       r.id,
-				Name:         name,
-				CommitSha:    tagCommit,
-				RefType:      TAG,
-			}
-			err1 = r.store.Refs(ref)
-			if err1 != nil {
-				return err1
-			}
-			subtaskCtx.IncProgress(1)
-		}
+		subtaskCtx.IncProgress(1)
 		return nil
-	}))
+	})
+	return errors.Convert(err)
 }
 
 // CollectBranches Collect branch data
 func (r *GitRepo) CollectBranches(subtaskCtx plugin.SubTaskContext) errors.Error {
-	var repoInter *git.BranchIterator
-	repoInter, err := r.repo.NewBranchIterator(git.BranchAll)
+	repoInter, err := r.repo.Branches()
 	if err != nil {
 		return errors.Convert(err)
 	}
-	return errors.Convert(repoInter.ForEach(func(branch *git.Branch, branchType git.BranchType) error {
+	head, err := r.repo.Head()
+	if err != nil {
+		return errors.Convert(err)
+	}
+	err = repoInter.ForEach(func(branch *plumbing.Reference) error {
 		select {
 		case <-subtaskCtx.GetContext().Done():
 			return subtaskCtx.GetContext().Err()
 		default:
 		}
-		if branch.IsBranch() || branch.IsRemote() {
-			name, err1 := branch.Name()
-			if err1 != nil && err1.Error() != TypeNotMatchError {
-				return err1
-			}
-			var sha string
-			if oid := branch.Target(); oid != nil {
-				sha = oid.String()
-			}
+		if branch.Name().IsBranch() || branch.Name().IsRemote() {
+			var sha string = branch.Hash().String()
 			ref := &code.Ref{
-				DomainEntity: domainlayer.DomainEntity{Id: fmt.Sprintf("%s:%s", r.id, name)},
+				DomainEntity: domainlayer.DomainEntity{Id: fmt.Sprintf("%s:%s", r.id, branch.Name().String())},
 				RepoId:       r.id,
-				Name:         name,
+				Name:         branch.Name().String(),
 				CommitSha:    sha,
 				RefType:      BRANCH,
+				IsDefault:    branch.Name().String() == head.Name().String(),
 			}
-			ref.IsDefault, err1 = branch.IsHead()
-			if err1 != nil && err1.Error() != TypeNotMatchError {
-				return err1
-			}
-			err1 = r.store.Refs(ref)
+			err1 := r.store.Refs(ref)
 			if err1 != nil && err1.Error() != TypeNotMatchError {
 				return err1
 			}
@@ -217,18 +210,15 @@ func (r *GitRepo) CollectBranches(subtaskCtx plugin.SubTaskContext) errors.Error
 			return nil
 		}
 		return nil
-	}))
+	})
+	return errors.Convert(err)
 }
 
 // CollectCommits Collect data from each commit, we can also get the diff line
 func (r *GitRepo) CollectCommits(subtaskCtx plugin.SubTaskContext) errors.Error {
-	opts, err := getDiffOpts()
-	if err != nil {
-		return err
-	}
 	db := subtaskCtx.GetDal()
 	components := make([]code.Component, 0)
-	err = db.All(&components, dal.From(components), dal.Where("repo_id= ?", r.id))
+	err := db.All(&components, dal.From(components), dal.Where("repo_id= ?", r.id))
 	if err != nil {
 		return err
 	}
@@ -236,57 +226,54 @@ func (r *GitRepo) CollectCommits(subtaskCtx plugin.SubTaskContext) errors.Error 
 	for _, component := range components {
 		componentMap[component.Name] = regexp.MustCompile(component.PathRegex)
 	}
-	odb, err := errors.Convert01(r.repo.Odb())
-	if err != nil {
-		return err
+	commitIter, err1 := r.repo.CommitObjects()
+	if err1 != nil {
+		return errors.Convert(err1)
 	}
-	return errors.Convert(odb.ForEach(func(id *git.Oid) error {
+	err2 := commitIter.ForEach(func(commit *object.Commit) error {
 		select {
 		case <-subtaskCtx.GetContext().Done():
 			return subtaskCtx.GetContext().Err()
 		default:
 		}
-		commit, err1 := r.repo.LookupCommit(id)
-		if err1 != nil && err1.Error() != TypeNotMatchError {
-			return errors.Convert(err1)
-		}
-		if commit == nil {
-			return nil
-		}
-		commitSha := commit.Id().String()
+		commitSha := commit.Hash.String()
 		r.logger.Debug("process commit: %s", commitSha)
 		c := &code.Commit{
 			Sha:     commitSha,
-			Message: commit.Message(),
+			Message: commit.Message,
 		}
-		author := commit.Author()
-		if author != nil {
-			c.AuthorName = author.Name
-			c.AuthorEmail = author.Email
-			c.AuthorId = author.Email
-			c.AuthoredDate = author.When
+
+		c.AuthorName = commit.Author.Name
+		c.AuthorEmail = commit.Author.Email
+		c.AuthorId = commit.Author.Email
+		c.AuthoredDate = commit.Author.When
+
+		c.CommitterName = commit.Committer.Name
+		c.CommitterEmail = commit.Committer.Email
+		c.CommitterId = commit.Committer.Email
+		c.CommittedDate = commit.Committer.When
+
+		err1 := r.storeParentCommits(commitSha, commit)
+		if err1 != nil {
+			return err1
 		}
-		committer := commit.Committer()
-		if committer != nil {
-			c.CommitterName = committer.Name
-			c.CommitterEmail = committer.Email
-			c.CommitterId = committer.Email
-			c.CommittedDate = committer.When
+		var parent *object.Commit
+		var errParent error
+		if commit.NumParents() > 0 {
+			parents := commit.Parents()
+			parent, errParent = parents.Next()
+			if errParent != nil {
+				return errParent
+			}
 		}
-		err = r.storeParentCommits(commitSha, commit)
+		stats, err := r.getDiffComparedToParent(c.Sha, commit, parent, componentMap)
 		if err != nil {
 			return err
 		}
-		var parent *git.Commit
-		if commit.ParentCount() > 0 {
-			parent = commit.Parent(0)
+		for _, file := range stats {
+			c.Additions += file.Addition
+			c.Deletions += file.Deletion
 		}
-		var stats *git.DiffStats
-		if stats, err = r.getDiffComparedToParent(c.Sha, commit, parent, opts, componentMap); err != nil {
-			return err
-		}
-		c.Additions += stats.Insertions()
-		c.Deletions += stats.Deletions()
 		err = r.store.Commits(c)
 		if err != nil {
 			return err
@@ -301,28 +288,29 @@ func (r *GitRepo) CollectCommits(subtaskCtx plugin.SubTaskContext) errors.Error 
 		}
 		subtaskCtx.IncProgress(1)
 		return nil
-	}))
+	})
+	return errors.Convert(err2)
 }
 
-func (r *GitRepo) storeParentCommits(commitSha string, commit *git.Commit) errors.Error {
+func (r *GitRepo) storeParentCommits(commitSha string, commit *object.Commit) errors.Error {
 	var commitParents []*code.CommitParent
-	for i := uint(0); i < commit.ParentCount(); i++ {
-		parent := commit.Parent(i)
-		if parent != nil {
-			if parentId := parent.Id(); parentId != nil {
-				commitParents = append(commitParents, &code.CommitParent{
-					CommitSha:       commitSha,
-					ParentCommitSha: parentId.String(),
-				})
-			}
-		}
+	var parents = commit.Parents()
+	err := parents.ForEach(func(parent *object.Commit) error {
+		commitParents = append(commitParents, &code.CommitParent{
+			CommitSha:       commitSha,
+			ParentCommitSha: parent.ID().String(),
+		})
+		return nil
+	})
+	if err != nil {
+		return errors.Convert(err)
 	}
 	return r.store.CommitParents(commitParents)
 }
 
-func (r *GitRepo) getDiffComparedToParent(commitSha string, commit *git.Commit, parent *git.Commit, opts *git.DiffOptions, componentMap map[string]*regexp.Regexp) (*git.DiffStats, errors.Error) {
+func (r *GitRepo) getDiffComparedToParent(commitSha string, commit *object.Commit, parent *object.Commit, componentMap map[string]*regexp.Regexp) (object.FileStats, errors.Error) {
 	var err error
-	var parentTree, tree *git.Tree
+	var parentTree, tree *object.Tree
 	if parent != nil {
 		parentTree, err = parent.Tree()
 	}
@@ -333,98 +321,154 @@ func (r *GitRepo) getDiffComparedToParent(commitSha string, commit *git.Commit, 
 	if err != nil {
 		return nil, errors.Convert(err)
 	}
-	var diff *git.Diff
-	diff, err = r.repo.DiffTreeToTree(parentTree, tree, opts)
+
+	diff, err := object.DiffTree(parentTree, tree)
 	if err != nil {
 		return nil, errors.Convert(err)
 	}
 	cfg := config.GetConfig()
 	skipCommitFiles := cfg.GetBool(SkipCommitFiles)
 	if !skipCommitFiles {
-		err = r.storeCommitFilesFromDiff(commitSha, diff, componentMap)
+		err = r.storeCommitFilesFromDiff(commitSha, &diff, componentMap)
 		if err != nil {
 			return nil, errors.Convert(err)
 		}
 	}
-	var stats *git.DiffStats
-	stats, err = diff.Stats()
+
+	patch, err := diff.Patch()
 	if err != nil {
 		return nil, errors.Convert(err)
 	}
-	return stats, nil
+	return patch.Stats(), nil
 }
 
-func (r *GitRepo) storeCommitFilesFromDiff(commitSha string, diff *git.Diff, componentMap map[string]*regexp.Regexp) errors.Error {
-	var commitFile *code.CommitFile
-	var commitFileComponent *code.CommitFileComponent
-	var err error
-	err = diff.ForEach(func(file git.DiffDelta, progress float64) (
-		git.DiffForEachHunkCallback, error) {
-		if commitFile != nil {
-			err = r.store.CommitFiles(commitFile)
-			if err != nil {
-				r.logger.Error(err, "CommitFiles error")
-				return nil, err
-			}
+func (r *GitRepo) storeCommitFilesFromDiff(commitSha string, changes *object.Changes, componentMap map[string]*regexp.Regexp) errors.Error {
+	patch, err := changes.Patch()
+	if err != nil {
+		return errors.Convert(err)
+	}
+	for _, filePatch := range patch.FilePatches() {
+		fromFile, toFile := filePatch.Files()
+		var filePath string
+		if toFile == nil {
+			filePath = fromFile.Path()
+		} else {
+			filePath = toFile.Path()
 		}
-
-		commitFile = new(code.CommitFile)
-		commitFile.CommitSha = commitSha
-		commitFile.FilePath = file.NewFile.Path
 
 		// With some long path,the varchar(255) was not enough both ID and file_path
 		// So we use the hash to compress the path in ID and add length of file_path.
 		// Use commitSha and the sha256 of FilePath to create id
 		shaFilePath := sha256.New()
-		shaFilePath.Write([]byte(file.NewFile.Path))
-		commitFile.Id = commitSha + ":" + hex.EncodeToString(shaFilePath.Sum(nil))
+		shaFilePath.Write([]byte(filePath))
+		commitFileId := commitSha + ":" + hex.EncodeToString(shaFilePath.Sum(nil))
+		commitFile := code.CommitFile{
+			CommitSha: commitSha,
+			FilePath:  filePath,
+		}
+		commitFile.Id = commitFileId
+		// iterate over the chunks
+		for _, chunk := range filePatch.Chunks() {
+			// iterate over the chunks, get addition lines and deletion lines
+			if chunk.Type() == diff.Add {
+				commitFile.Additions += lineCount(chunk.Content())
+			} else if chunk.Type() == diff.Delete {
+				commitFile.Deletions += lineCount(chunk.Content())
+			}
+		}
+		err = r.store.CommitFiles(&commitFile)
+		if err != nil {
+			r.logger.Error(err, "CommitFiles error")
+		}
 
-		commitFileComponent = new(code.CommitFileComponent)
+		// load component info
+		commitFileComponent := code.CommitFileComponent{
+			CommitFileId: commitFileId,
+		}
 		for component, reg := range componentMap {
 			if reg.MatchString(commitFile.FilePath) {
 				commitFileComponent.ComponentName = component
 				break
 			}
 		}
-		commitFileComponent.CommitFileId = commitFile.Id
 		if commitFileComponent.ComponentName == "" {
 			commitFileComponent.ComponentName = "Default"
 		}
-		return func(hunk git.DiffHunk) (git.DiffForEachLineCallback, error) {
-			return func(line git.DiffLine) error {
-				if line.Origin == git.DiffLineAddition {
-					commitFile.Additions += line.NumLines
-				}
-				if line.Origin == git.DiffLineDeletion {
-					commitFile.Deletions += line.NumLines
-				}
-				return nil
-			}, nil
-		}, nil
-	}, git.DiffDetailLines)
-	if commitFileComponent != nil {
-		err = r.store.CommitFileComponents(commitFileComponent)
+
+		err = r.store.CommitFileComponents(&commitFileComponent)
 		if err != nil {
 			r.logger.Error(err, "CommitFileComponents error")
 		}
 	}
-	if commitFile != nil {
-		err = r.store.CommitFiles(commitFile)
+	return nil
+}
+
+// Collecti Snapshot blame data of HEAD commit
+func (r *GitRepo) CollectSnapshot(subtaskCtx plugin.SubTaskContext) errors.Error {
+	var repo = r.repo
+	head, err := repo.Head()
+	if err != nil {
+		return errors.Convert(err)
+	}
+	commit, err := repo.CommitObject(head.Hash())
+	if err != nil {
+		return errors.Convert(err)
+	}
+	tree, err := commit.Tree()
+	if err != nil {
+		return errors.Convert(err)
+	}
+	// get all files in the tree
+	var files []*object.File
+	var fileIter = tree.Files()
+	err = fileIter.ForEach(func(file *object.File) error {
+		select {
+		case <-subtaskCtx.GetContext().Done():
+			return subtaskCtx.GetContext().Err()
+		default:
+		}
+		files = append(files, file)
+		return nil
+	})
+	if err != nil {
+		return errors.Convert(err)
+	}
+	// get the blame of each file
+	for _, file := range files {
+		select {
+		case <-subtaskCtx.GetContext().Done():
+			return errors.Convert(subtaskCtx.GetContext().Err())
+		default:
+		}
+		blame, err := git.Blame(commit, file.Name)
 		if err != nil {
-			r.logger.Error(err, "CommitFiles error")
+			return errors.Convert(err)
+		}
+		for lineNo, line := range blame.Lines {
+			if line != nil {
+				commitLine := &code.RepoSnapshot{
+					RepoId:    r.id,
+					CommitSha: commit.Hash.String(),
+					FilePath:  file.Name,
+					LineNo:    lineNo + 1,
+				}
+				err = r.store.RepoSnapshot(commitLine)
+				if err != nil {
+					return errors.Convert(err)
+				}
+			}
 		}
 	}
-	return errors.Convert(err)
+	r.logger.Info("line change collect success")
+	return nil
 }
 
 // CollectDiffLine get line diff data from a specific branch
 func (r *GitRepo) CollectDiffLine(subtaskCtx plugin.SubTaskContext) errors.Error {
-	//Using this subtask,we can get every line change in every commit.
-	//We maintain a snapshot structure to get which commit each deleted line belongs to
-	snapshot := make(map[string] /*file path*/ *models.FileBlame)
+	//Using this subtask, we can get every line change in every commit, tracing back from HEAD to the first commit
 	repo := r.repo
 	//step 1. get the reverse commit list
-	commitList := make([]git.Commit, 0)
+	commitList := make([]object.Commit, 0)
 	//get currently head commitsha, dafault is master branch
 	// check branch, if not master, checkout to branch's head
 	commitOid, err1 := repo.Head()
@@ -432,15 +476,14 @@ func (r *GitRepo) CollectDiffLine(subtaskCtx plugin.SubTaskContext) errors.Error
 		return errors.Convert(err1)
 	}
 	//get head commit object and add into commitList
-	commit, err1 := repo.LookupCommit(commitOid.Target())
+	commit, err1 := repo.CommitObject(commitOid.Hash())
 	if err1 != nil && err1.Error() != TypeNotMatchError {
 		return errors.Convert(err1)
 	}
 	commitList = append(commitList, *commit)
 	// if current head has parents, get parent commitsha
-	for commit != nil && commit.ParentCount() > 0 {
-		pid := commit.ParentId(0)
-		commit, err1 = repo.LookupCommit(pid)
+	for commit != nil && commit.NumParents() > 0 {
+		commit, err1 := commit.Parent(0)
 		if err1 != nil && err1.Error() != TypeNotMatchError {
 			return errors.Convert(err1)
 		}
@@ -452,144 +495,262 @@ func (r *GitRepo) CollectDiffLine(subtaskCtx plugin.SubTaskContext) errors.Error
 	}
 	//step 2. get the diff of each commit
 	// for each commit, get the diff
-	for _, commitsha := range commitList {
-		curcommit, err := repo.LookupCommit(commitsha.Id())
+	for _, curcommit := range commitList {
+		var parentCommit *object.Commit
+		var parentTree, tree *object.Tree
+		tree, err := curcommit.Tree()
 		if err != nil {
 			return errors.Convert(err)
 		}
-		if curcommit.ParentCount() == 0 || curcommit.ParentCount() > 0 {
-			var parentTree, tree *git.Tree
-			tree, err = curcommit.Tree()
+		if curcommit.NumParents() > 0 {
+			parentCommit, err = curcommit.Parent(0)
 			if err != nil {
 				return errors.Convert(err)
 			}
-			var diff *git.Diff
-			//FIXME error type convert
-			opts, err := git.DefaultDiffOptions()
-			opts.NotifyCallback = func(diffSoFar *git.Diff, delta git.DiffDelta, matchedPathSpec string) error {
-				return nil
-			}
+			parentTree, err = parentCommit.Tree()
+		}
+		changes, err := object.DiffTree(parentTree, tree)
+		if err != nil {
+			return errors.Convert(err)
+		}
+
+		for _, fileDiff := range changes {
+			fromFile, toFile, err := fileDiff.Files()
 			if err != nil {
 				return errors.Convert(err)
 			}
-			if curcommit.ParentCount() > 0 {
-				parent := curcommit.Parent(0)
-				parentTree, err = parent.Tree()
-			}
-			diff, err = repo.DiffTreeToTree(parentTree, tree, &opts)
-			if err != nil {
-				return errors.Convert(err)
-			}
-			deleted := make(models.DiffLines, 0)
-			added := make(models.DiffLines, 0)
-			var lastFile string
-			lastFile = ""
-			err = diff.ForEach(func(file git.DiffDelta, progress float64) (git.DiffForEachHunkCallback, error) {
-				//if doesn't exist in snapshot, create a new one
-				if _, ok := snapshot[file.OldFile.Path]; !ok {
-					fileBlame, err := models.NewFileBlame()
-					if err != nil {
-						r.logger.Info("Create FileBlame Error")
-						return nil, err
-					}
-					snapshot[file.OldFile.Path] = (*models.FileBlame)(fileBlame)
+			var filePath string
+			var prevBlame *git.BlameResult
+			if fromFile != nil {
+				prevBlame, err = git.Blame(parentCommit, filePath)
+				if err != nil {
+					return errors.Convert(err)
 				}
-				if lastFile == "" {
-					lastFile = file.NewFile.Path
-				} else if lastFile != file.NewFile.Path {
-					updateSnapshotFileBlame(curcommit, deleted, added, lastFile, snapshot)
-					//reset the deleted and added,last_file now is current file
-					deleted = make([]git.DiffLine, 0)
-					added = make([]git.DiffLine, 0)
-					lastFile = file.NewFile.Path
-				}
-				hunkNum := 0
-				return func(hunk git.DiffHunk) (git.DiffForEachLineCallback, error) {
-					hunkNum++
-					return func(line git.DiffLine) error {
+			}
+			if toFile != nil {
+				filePath = toFile.Name
+			} else {
+				filePath = fromFile.Name
+			}
+
+			filePatch, err := fileDiff.Patch()
+			if err != nil {
+				return errors.Convert(err)
+			}
+			filePatches := filePatch.FilePatches()
+			for _, fp := range filePatches {
+				var hunkGen = newHunksGenerator(fp.Chunks(), 0)
+				hunks := hunkGen.Generate()
+				for hunkNum, hunk := range hunks {
+					for offset, line := range hunk.ops {
 						commitLineChange := &code.CommitLineChange{}
-						commitLineChange.CommitSha = curcommit.Id().String()
-						commitLineChange.ChangedType = line.Origin.String()
-						commitLineChange.LineNoNew = line.NewLineno
-						commitLineChange.LineNoOld = line.OldLineno
-						commitLineChange.OldFilePath = file.OldFile.Path
-						commitLineChange.NewFilePath = file.NewFile.Path
+						commitLineChange.CommitSha = curcommit.Hash.String()
+						if line.t == diff.Equal {
+							continue
+						} else if line.t == diff.Add {
+							commitLineChange.ChangedType = "add"
+						} else if line.t == diff.Delete {
+							commitLineChange.ChangedType = "delete"
+						}
+						commitLineChange.LineNoNew = hunk.toLine + offset
+						commitLineChange.LineNoOld = hunk.fromLine + offset
+						commitLineChange.OldFilePath = fromFile.Name
+						commitLineChange.NewFilePath = toFile.Name
 						commitLineChange.HunkNum = hunkNum
-						commitLineChange.Id = curcommit.Id().String() + ":" + file.NewFile.Path + ":" + strconv.Itoa(line.OldLineno) + ":" + strconv.Itoa(line.NewLineno)
-						if line.Origin == git.DiffLineAddition {
-							added = append(added, line)
-						} else if line.Origin == git.DiffLineDeletion {
-							fb := snapshot[file.OldFile.Path]
-							l := fb.Find(line.OldLineno)
-							if l != nil && l.Value != nil {
-								temp := snapshot[file.OldFile.Path].Find(line.OldLineno)
-								commitLineChange.PrevCommit = temp.Value.(string)
-							} else {
-								r.logger.Info("err", file.OldFile.Path, line.OldLineno, curcommit.Id().String())
+						commitLineChange.Id = curcommit.Hash.String() + ":" + filePath + ":" + strconv.Itoa(hunk.fromLine+offset) + ":" + strconv.Itoa(hunk.toLine+offset)
+						if prevBlame != nil {
+							lineBlame := prevBlame.Lines[hunk.fromLine+offset]
+							if lineBlame != nil {
+								commitLineChange.PrevCommit = lineBlame.Hash.String()
 							}
-							deleted = append(deleted, line)
 						}
 						err = r.store.CommitLineChange(commitLineChange)
 						if err != nil {
 							return errors.Convert(err)
 						}
-						return nil
-					}, nil
-				}, nil
-			}, git.DiffDetailLines)
-			if err != nil {
-				return errors.Convert(err)
+					}
+				}
 			}
-			//finally,process the last file in diff
-			updateSnapshotFileBlame(curcommit, deleted, added, lastFile, snapshot)
 		}
 	}
 	r.logger.Info("line change collect success")
-	db := subtaskCtx.GetDal()
-	err := db.Delete(&code.RepoSnapshot{}, dal.Where("repo_id= ?", r.id))
-	if err != nil {
-		return errors.Convert(err)
-	}
-	for fp := range snapshot {
-		temp := snapshot[fp]
-		count := 0
-		for e := temp.Lines.Front(); e != nil; e = e.Next() {
-			count++
-			snapshotLine := &code.RepoSnapshot{}
-			snapshotLine.RepoId = r.id
-			snapshotLine.LineNo = count
-			snapshotLine.CommitSha = e.Value.(string)
-			snapshotLine.FilePath = fp
-			err := r.store.RepoSnapshot(snapshotLine)
-			if err != nil {
-				r.logger.Info("error")
-				return err
-			}
-		}
-
-	}
-
-	r.logger.Info("collect snapshot finished")
 	return nil
 }
 
-func updateSnapshotFileBlame(currentCommit *git.Commit, deleted models.DiffLines, added models.DiffLines, lastFile string, snapshot map[string]*models.FileBlame) {
-	sort.Sort(deleted)
-	for _, line := range deleted {
-		snapshot[lastFile].RemoveLine(line.OldLineno)
+func lineCount(content string) int {
+	count := 0
+	for _, c := range content {
+		if c == '\n' {
+			count++
+		}
 	}
-	for _, line := range added {
-		snapshot[lastFile].AddLine(line.NewLineno, currentCommit.Id().String())
+	return count
+}
+
+type hunksGenerator struct {
+	fromLine, toLine            int
+	ctxLines                    int
+	chunks                      []diff.Chunk
+	current                     *hunk
+	hunks                       []*hunk
+	beforeContext, afterContext []string
+}
+
+func newHunksGenerator(chunks []diff.Chunk, ctxLines int) *hunksGenerator {
+	return &hunksGenerator{
+		chunks:   chunks,
+		ctxLines: ctxLines,
 	}
 }
 
-func getDiffOpts() (*git.DiffOptions, errors.Error) {
-	opts, err := git.DefaultDiffOptions()
-	if err != nil {
-		return nil, errors.Convert(err)
+func (g *hunksGenerator) Generate() []*hunk {
+	for i, chunk := range g.chunks {
+		lines := splitLines(chunk.Content())
+		nLines := len(lines)
+
+		switch chunk.Type() {
+		case diff.Equal:
+			g.fromLine += nLines
+			g.toLine += nLines
+			g.processEqualsLines(lines, i)
+		case diff.Delete:
+			if nLines != 0 {
+				g.fromLine++
+			}
+
+			g.processHunk(i, chunk.Type())
+			g.fromLine += nLines - 1
+			g.current.AddOp(chunk.Type(), lines...)
+		case diff.Add:
+			if nLines != 0 {
+				g.toLine++
+			}
+			g.processHunk(i, chunk.Type())
+			g.toLine += nLines - 1
+			g.current.AddOp(chunk.Type(), lines...)
+		}
+
+		if i == len(g.chunks)-1 && g.current != nil {
+			g.hunks = append(g.hunks, g.current)
+		}
 	}
-	opts.NotifyCallback = func(diffSoFar *git.Diff, delta git.DiffDelta, matchedPathSpec string) error {
-		return nil
+
+	return g.hunks
+}
+
+func (g *hunksGenerator) processHunk(i int, op diff.Operation) {
+	if g.current != nil {
+		return
 	}
-	return &opts, nil
+
+	var ctxPrefix string
+	linesBefore := len(g.beforeContext)
+	if linesBefore > g.ctxLines {
+		ctxPrefix = g.beforeContext[linesBefore-g.ctxLines-1]
+		g.beforeContext = g.beforeContext[linesBefore-g.ctxLines:]
+		linesBefore = g.ctxLines
+	}
+
+	g.current = &hunk{ctxPrefix: strings.TrimSuffix(ctxPrefix, "\n")}
+	g.current.AddOp(diff.Equal, g.beforeContext...)
+
+	switch op {
+	case diff.Delete:
+		g.current.fromLine, g.current.toLine =
+			g.addLineNumbers(g.fromLine, g.toLine, linesBefore, i, diff.Add)
+	case diff.Add:
+		g.current.toLine, g.current.fromLine =
+			g.addLineNumbers(g.toLine, g.fromLine, linesBefore, i, diff.Delete)
+	}
+
+	g.beforeContext = nil
+}
+
+// addLineNumbers obtains the line numbers in a new chunk.
+func (g *hunksGenerator) addLineNumbers(la, lb int, linesBefore int, i int, op diff.Operation) (cla, clb int) {
+	cla = la - linesBefore
+	// we need to search for a reference for the next diff
+	switch {
+	case linesBefore != 0 && g.ctxLines != 0:
+		if lb > g.ctxLines {
+			clb = lb - g.ctxLines + 1
+		} else {
+			clb = 1
+		}
+	case g.ctxLines == 0:
+		clb = lb
+	case i != len(g.chunks)-1:
+		next := g.chunks[i+1]
+		if next.Type() == op || next.Type() == diff.Equal {
+			// this diff will be into this chunk
+			clb = lb + 1
+		}
+	}
+
+	return
+}
+
+func (g *hunksGenerator) processEqualsLines(ls []string, i int) {
+	if g.current == nil {
+		g.beforeContext = append(g.beforeContext, ls...)
+		return
+	}
+
+	g.afterContext = append(g.afterContext, ls...)
+	if len(g.afterContext) <= g.ctxLines*2 && i != len(g.chunks)-1 {
+		g.current.AddOp(diff.Equal, g.afterContext...)
+		g.afterContext = nil
+	} else {
+		ctxLines := g.ctxLines
+		if ctxLines > len(g.afterContext) {
+			ctxLines = len(g.afterContext)
+		}
+		g.current.AddOp(diff.Equal, g.afterContext[:ctxLines]...)
+		g.hunks = append(g.hunks, g.current)
+
+		g.current = nil
+		g.beforeContext = g.afterContext[ctxLines:]
+		g.afterContext = nil
+	}
+}
+
+func splitLines(s string) []string {
+	out := splitLinesRegexp.FindAllString(s, -1)
+	if out[len(out)-1] == "" {
+		out = out[:len(out)-1]
+	}
+	return out
+}
+
+type hunk struct {
+	fromLine int
+	toLine   int
+
+	fromCount int
+	toCount   int
+
+	ctxPrefix string
+	ops       []*op
+}
+
+func (h *hunk) AddOp(t diff.Operation, ss ...string) {
+	n := len(ss)
+	switch t {
+	case diff.Add:
+		h.toCount += n
+	case diff.Delete:
+		h.fromCount += n
+	case diff.Equal:
+		h.toCount += n
+		h.fromCount += n
+	}
+
+	for _, s := range ss {
+		h.ops = append(h.ops, &op{s, t})
+	}
+}
+
+type op struct {
+	text string
+	t    diff.Operation
 }
