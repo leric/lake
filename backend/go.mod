@@ -13,7 +13,6 @@ require (
 	github.com/google/uuid v1.3.0
 	github.com/jackc/pgx/v5 v5.3.1 // indirect
 	github.com/lib/pq v1.10.2
-	github.com/libgit2/git2go/v33 v33.0.6
 	github.com/magiconair/properties v1.8.5
 	github.com/merico-dev/graphql v0.0.0-20221027131946-77460a1fd4cd
 	github.com/mitchellh/mapstructure v1.5.0
